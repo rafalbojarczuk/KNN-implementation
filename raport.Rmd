@@ -1,0 +1,201 @@
+---
+title: "Metoda k-najbliższych sąsiadów"
+author: "Rafał Bojarczuk"
+date: "17 05 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=6, fig.height=3)
+
+library(knitr)
+library(ggplot2)
+library(pracma)
+source('utils.R')
+```
+
+## Wstęp
+
+Celem tej pracy jest zademonstrowanie skuteczności klasyfikatora k-najbliższych sąsiadów - jednego z popularniejszych algorytmów służących do zadań klasyfikacji. Jego popularność w dużej mierze wynika z jego prostoty. Mając zbiór obserwacji oraz informację o klasach do których one należą, możemy próbować odgadnąć etykietę nowej obserwacji patrząc na to, której klasy reprezentanci występują najczęściej wśród zbioru k najbliższych znanych obserwacji względem przyjętej metryki. Na przykład jeżeli 6 najbliższych sąsiadów (w kolejności od najmniejszej odległości do największej) nowej danej należy do klas numer 1,2,2,3,3,3 to dla k=1 zaklasyfikujemy nową obserwację jako reprezentanta klasy 1, dla k=3 jako 2 a dla k=6 jako 3. W przypadku "remisu" możemy wylosować klasę spośród najczęściej się powtarzających dla osiągnięcia nieobciążoności estymatora lub ważyć je ze względu na odległość - te znajdujące się bliżej mają "decydujący głos". Ja posłużę się pierwszą opcją.
+
+## Regresja porządkowa
+
+Decyzja o wyborze klasy na podstawie mody z etykiet najbliższych sąsiadów jest standardowym i w miarę oczywistym podejściem w przypadku gdy przewidywana wartość jest zmienną na skali nominalnej. Lecz metoda k-najbliższych sąsiadów może mieć zastosowanie również dla danych porządkowych. Załóżmy, że na podstawie aktywności mózgu chcemy przewidzieć subiektywną odpowiedź pacjenta, jak duży odczuwa ból w skali od 1 do 10. Jeżeli aktywność mózgu posiada pewne cechy podobne (bliskie) do znanego nam bólu ocenianego wcześniej na 1 oraz pewne cechy podobne do bólu o natężeniu 3 to może sensownym będzie zaklasyfikować go jako coś pomiędzy, a nie zgadywać odpowiedź tylko ze zbioru {1,3}. W tym przypadku możemy użyć innych funkcji wyłaniających najbardziej prawdopodobną klasę spośród sąsiadów niż tylko modę. Porównamy działanie kilku takich funkcji:
+
+- **srednia_a()** - wyznacza najbliższą wartość naturalną do średniej arytmetycznej z etykiet, w przypadku gdy taka wartość nie jest określona jednoznacznie - losuje losową z dwóch wartości
+
+- **mediana()** - zwraca najbliższą wartość naturalną do mediany
+
+- **minkara1.5()** - zwraca wartość u spośród etykiet sąsiadów, która minimalizuje funkcję straty $\sum_{j = 1}^{k} |N[j]-u|^{1.5}$ gdzie $N[j]$ to etykieta j-tego sąsiada
+
+- **minkara3.0()** - jak wyżej, tylko funkcją straty jest $\sum_{j = 1}^{k} |N[j]-u|^{3.0}$
+
+## Zbiory danych
+
+```{r loading data, echo=FALSE}
+wine_quality <- read.csv("winequality-red.csv")
+affairs <- read.csv("affairs.csv")
+cement_strength <- read.csv("cement_strength.csv")
+wisconsin_breast <- read.csv("wisconsin_breast_ord.csv")
+skill <- read.csv("skill.csv")
+```
+
+Do prezentacji wyników posłużę się kilkoma zbiorami danych pobranymi ze strony [https://www.gagolewski.com/resources/data/ordinal-regression/](https://www.gagolewski.com/resources/data/ordinal-regression/). Zbiór *winequality_red* zawiera informacje na temat słodkości, stężenia alkoholu i siarczynów oraz innych cech czerwonych win wraz z nadaną przez ekspertów oceną w skali od 1 do 7. Zbiór *skill* zawiera dane na temat graczy StarCrafta 2 - wiek, łączny czas gry, liczba akcji wykonywanych na minutę oraz numer ligi w jakiej się znajdują - Bronze, Silver, Gold, ... itd. zakodowany liczbą od 1 do 8. Do testów użyłem też zbiorów *affairs*, *cement_strength* oraz *wisconsin_breast_ord*. \newline
+
+```{r show data, echo=FALSE}
+
+kable(head(wine_quality[,1:7], 5), caption = "Red wine quality (selected columns)", format="latex")
+kable(head(skill[,1:7], 5), caption = "StarCraft 2 skill (selected columns)", format="latex")
+```
+
+## Przygotowanie danych do oceny jakości klasyfikatora
+
+Jak widać wyżej, w zbiorze *skills* wartości w kolumnie HoursPerWeek wyraża się w dziesiątkach, natomiast inne kolumny takie jak, AssignToHotkeys lub SelectByHotkeys zawierają bardzo małe liczby, o niewielkiej wariancji. Powoduje to sytuację, że różnica między wartościami HoursPerWeek dwóch obserwacji będzie znacznie przeważała podczas obliczania odległości między danymi, a różnica między wartościami z kolumny AssignToHotkeys nie będzie grała żadnej roli. Dla uproszczenia załóżmy, że to jedyne dwie cechy definiujące umiejętności gracza StarCrafta, aby łatwo je zwizualizować.
+
+```{r skill skewed, echo=FALSE}
+
+plot(skill$HoursPerWeek[1:100], skill$AssignToHotkeys[1:100], xlim=c(0,100), ylim=c(0,100),
+      xlab="Hours per week", ylab="Assign to hotkeys", pch=21, col='black', bg='orange')
+```
+
+Nie można rozróżnić obserwacji ze względu na cechę AssignToHotkeys! \newline
+Po zestandaryzowaniu kolumn:
+
+```{r skill normalized, echo=FALSE}
+skill_features <- skill[,-1]
+skill_features <- as.data.frame(normalize_columns(skill_features))
+
+plot(skill_features$HoursPerWeek[1:100], 
+    skill_features$AssignToHotkeys[1:100], xlim=c(-3,3), ylim=c(-3,3), 
+    xlab="Hours per week", ylab="Assign to hotkeys", pch=21, col='black', bg='orange')
+```
+
+Teraz lepiej. Nie w każdej analizowanej ramce występuje problem z drastycznie różniącymi się zakresami wartości, ale przed użyciem algorytmu zestandaryzowałem wszystkie - nie zaszkodzi, a może pomóc.
+
+## Ocena jakości
+
+Skorzystamy z metody 5-krotnej walidacji do wyznaczenia podziału na zbiór treningowy (znanych obserwacji) oraz testowy (nieznanych danych). Oznacza to, że każdy zbiór podzielimy na 5 równych (bądź prawie równych) części $X^{(1)}, ..., X^{(5)}$, a następnie dla każdego $i \in \{1,2,3,4,5\}$ użyjemy $X^{(i)}$ jako zbiór testowy i $X \setminus X^{(i)}$ jako zbiór uczący. Wynikiem dla danego zbioru będzie średni błąd ze wszystkich podziałów. Będziemy mierzyć proporcję błędnie sklasyfikowanych danych do wszystkich, błąd średniokwadratowy oraz średnią odległość od właściwej etykiety (Mean Absolute Distance).
+Testowane będą wszystkie kombinacje parametrów: $k \in \{1,3,5,7,9,11,13,15,17,19\}$ $p \in \{1,2\} \lor p=\infty$ dla każdej z funkcji agregujących wymienionych na początku
+
+## Wyniki
+
+Uznałem, że jako dwie najlepsze kombinacje (k, p, fun) wybiorę te które minimalizują błąd średniokwadratowy oraz błąd MAD między prawdziwymi a przewidywanymi klasami. Proporcja błędnych odpowiedzi do wszystkich tak samo traktuje zaklasyfikowanie 2jki jako 10tkę jak również 2jki jako 3jkę, a pierwszy przypadek jest dużo większą pomyłką. Ale wyświetlimy również najwyższą osiągniętą celność.
+
+### Zbiór *wine_quality*
+
+
+```{r wine, echo=FALSE}
+wine_benchmark <- read.csv("wine_quality_benchmark.csv")
+```
+
+#### MSE
+```{r wine mse, echo=FALSE}
+kable(wine_benchmark[wine_benchmark$MSE == min(wine_benchmark$MSE),-1], format="latex")
+```
+
+#### MAD
+
+```{r wine mad, echo=FALSE}
+kable(wine_benchmark[wine_benchmark$MAD == min(wine_benchmark$MAD),-1], format="latex")
+```
+
+```{r wine err, echo=FALSE}
+cat("Najwyższa celność: ", (1-min(wine_benchmark$ERR))*100, "%")
+```
+
+
+### Zbiór *skill*
+
+
+```{r skills, echo=FALSE}
+skills_benchmark <- read.csv("skill_benchmark.csv")
+```
+
+#### MSE
+
+```{r skills mse, echo=FALSE}
+kable(skills_benchmark[skills_benchmark$MSE == min(skills_benchmark$MSE),-1], format="latex")
+```
+
+#### MAD
+
+```{r skills mad, echo=FALSE}
+kable(skills_benchmark[skills_benchmark$MAD == min(skills_benchmark$MAD),-1], format="latex")
+```
+
+```{r skills err, echo=FALSE}
+cat("Najwyższa celność: ", (1-min(skills_benchmark$ERR))*100, "%")
+```
+
+
+### Zbiór *cement_strength*
+
+
+```{r cement_strength, echo=FALSE}
+cement_benchmark <- read.csv("cement_strength_benchmark.csv")
+```
+
+#### MSE
+
+```{r cement_strength mse, echo=FALSE}
+kable(cement_benchmark[cement_benchmark$MSE == min(cement_benchmark$MSE),-1], format="latex")
+```
+
+#### MAD
+
+```{r cement_strength mad, echo=FALSE}
+kable(cement_benchmark[cement_benchmark$MAD == min(cement_benchmark$MAD),-1], format="latex")
+```
+
+```{r cement_strength err, echo=FALSE}
+cat("Najwyższa celność: ", (1-min(cement_benchmark$ERR))*100, "%")
+```
+
+### Zbiór *winconsin_breast_ord*
+
+
+```{r winconsin_breast, echo=FALSE}
+wisconsin_benchmark <- read.csv("wisconsin_breast_benchmark.csv")
+```
+
+#### MSE
+```{r winconsin_breast mse, echo=FALSE}
+kable(wisconsin_benchmark[wisconsin_benchmark$MSE == min(wisconsin_benchmark$MSE), -1], format="latex")
+```
+
+#### MAD
+
+```{r winconsin_breast mad, echo=FALSE}
+kable(wisconsin_benchmark[wisconsin_benchmark$MAD == min(wisconsin_benchmark$MAD), -1], format="latex")
+```
+
+```{r winconsin_breast err, echo=FALSE}
+cat("Najwyższa celność: ", (1-min(wisconsin_benchmark$ERR))*100, "%")
+```
+
+### Zbiór *affairs*
+
+
+```{r affairs, echo=FALSE}
+affairs_benchmark <- read.csv("affairs_benchmark.csv")
+```
+
+#### MSE
+
+```{r affairs mse, echo=FALSE}
+kable(affairs_benchmark[affairs_benchmark$MSE == min(affairs_benchmark$MSE), -1], format="latex")
+```
+
+#### MAD
+
+```{r affairs mad, echo=FALSE}
+kable(affairs_benchmark[affairs_benchmark$MAD == min(affairs_benchmark$MAD), -1], format="latex")
+```
+
+```{r affairs err, echo=FALSE}
+cat("Najwyższa celność: ", (1-min(affairs_benchmark$ERR))*100, "%")
+```
+
+## Podsumowanie
+
+Najlepsza celność jaką udało się nam osiągnąć to około 60% dla zbioru *cement_stregth*. Całkiem nieźle jak na tak prosty klasyfikator. Niestety dużo gorzej sobie poradził na przykład ze zbiorem *skills*. Zazwyczaj najmniejsze błędy obserwowaliśmy dla wysokich k (15-19), najprawdopodobniej dlatego, że są to dość złożone dane (liczba cech) jak na tak prostą metodę i skanując większy obszar dookoła algorytm podejmował lepszą decyzję, wyjątkiem był tu zbiór *cement_strength* gdzie najlepiej sprawdziło się k=1. Metoda k-nn działa dobrze, kiedy grupy utworzone przez klasy są zwarte, najlepiej oddalone od reprezentantów innych klas. Dużo gorzej radzą sobie gdy klasy na siebie nachodzą lub klasa nie tworzy jednego klastra, a na przykład kilka mniejszych. Weźmy za przykład zbiór czerwonych win - nie trudno wyobrazić sobie sytuację, w której byłoby dużo wysokich ocen zarówno wśród win o dużym stężeniu cukru jak i stosunkowo niewielkim, tak samo dobre mogę okazać się wina i mocniejsze i słabsze - w takim przypadku nie będzie jednego, dobrze określonego skupiska dobrych win w przestrzeni cech, a algorytm będzie miał problem z wyłonieniem najbardziej prawdopodobnej etykiety.
